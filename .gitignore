@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 acute_slices_plots/
 *.abf
+*.zip
+**/plots/

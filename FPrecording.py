@@ -35,16 +35,19 @@ def butter_lowpass(signal, sampling_rate, cutoff=500, order=4):
     return sosfiltfilt(sos, signal)
 
 # recording 
-rec_number = "11"
+rec_number = "06"
+date = "21082026"
+#file_path = f"C:\Users\tonje\Experiments\210826\rec210826\21082026_FP_cell1_organotypic_sp__00{rec_number}.abf"
+#file_path = f"Experiments\{date}\rec{date}\{date}_FP_cell1_organotypic_sp_00{rec_number}.abf"
 
-file_path = f"rec15072026/20260714_cell11__00{rec_number}.abf"
-
+file_path = Path(date) / f"rec{date}" / f"{date}_FP_cell1_organotypic_sp__00{rec_number}.abf"
 abf = pyabf.ABF(str(file_path))
+
 
 plt.figure()
 for sweep_number in abf.sweepList:
-    if sweep_number == 0:
-        continue
+    #if sweep_number == 0:
+     #   continue
     abf.setSweep(sweepNumber=sweep_number, channel=0)
 
 
@@ -87,7 +90,7 @@ plt.legend(loc="upper right")
 #plt.xlim(0.03,0.08)
 plt.tight_layout()
 plt.xlim(0.0325,0.07)
-plt.savefig(f"plots/all_sweeps_{rec_number}.png", dpi=300)
+plt.savefig(f"{date}/plots/all_sweeps_{rec_number}.png", dpi=300)
 plt.close()
 
 
@@ -123,5 +126,5 @@ plt.xlabel("Tid (ms)")
 plt.ylabel(abf.sweepLabelY)
 plt.title(f"Mean of {abf.sweepCount} sweeps")
 plt.tight_layout()
-plt.savefig(f"plots/mean_{rec_number}.png", dpi=300)
+plt.savefig(f"{date}/plots/mean_{rec_number}.png", dpi=300)
 plt.close()
