@@ -17,7 +17,15 @@ def butter_lowpass(signal, sampling_rate, cutoff=500, order=4):
     return sosfiltfilt(sos, signal)
 
 
-def compute_slope(time, signal, peak_time, onset_offset=0.001, search_window=0.015, low_frac=0.2, high_frac=0.8):
+def stim_time_s(abf):
+    """Stimulus pulse time (s) = onset of the shortest step epoch in the command waveform."""
+    ep = abf.sweepEpochs
+    durations = [p2 - p1 for p1, p2 in zip(ep.p1s, ep.p2s)]
+    idx = durations.index(min(durations))
+    return ep.p1s[idx] / abf.dataRate
+
+
+def compute_slope(time, signal, peak_time, onset_offset=0.001, search_window=0.025, low_frac=0.2, high_frac=0.8):
     # start litt etter artefakten, ikke ved peak_time selv
     search_start = peak_time + onset_offset
 
@@ -28,59 +36,93 @@ def compute_slope(time, signal, peak_time, onset_offset=0.001, search_window=0.0
     if len(segment_signal) < 2:
         return np.nan
 
-    trough_idx = np.argmin(segment_signal)
-    trough_value = segment_signal[trough_idx]
+    # dominant deflection may be negative (fEPSP) or positive (population spike
+    # overtaking the fEPSP at higher stimulus strengths) — pick whichever is larger
+    idx_min = np.argmin(segment_signal)
+    idx_max = np.argmax(segment_signal)
+    if abs(segment_signal[idx_min]) >= abs(segment_signal[idx_max]):
+        sign, peak_idx = 1.0, idx_min
+    else:
+        sign, peak_idx = -1.0, idx_max
 
-    # walk back from the trough to where its final, uninterrupted descent starts —
-    # skips over any earlier shoulder (e.g. fiber volley) that would otherwise get
-    # mixed into the 20-80% fit once it's large enough to fall inside that band
-    descent_start_idx = trough_idx
-    while descent_start_idx > 0 and segment_signal[descent_start_idx - 1] > segment_signal[descent_start_idx]:
-        descent_start_idx -= 1
+    working_signal = segment_signal * sign  # dominant deflection now always a negative peak
+    peak_value = working_signal[peak_idx]
 
-    falling_time = segment_time[descent_start_idx:trough_idx + 1]
-    falling_signal = segment_signal[descent_start_idx:trough_idx + 1]
-
-    low_val = low_frac * trough_value
-    high_val = high_frac * trough_value
-    fit_mask = (falling_signal <= low_val) & (falling_signal >= high_val)
-
-    if np.sum(fit_mask) < 2:
+    if peak_idx < 1:
         return np.nan
 
-    slope, intercept = np.polyfit(falling_time[fit_mask], falling_signal[fit_mask], 1)
-    return slope
+    # scan FORWARD from response onset to the peak for the first 20% and 80%
+    # threshold crossings. This only needs a first crossing, not an unbroken
+    # descent, so a small non-monotonic wobble (e.g. an early shoulder) before
+    # the real peak doesn't throw off where the fit window starts — unlike a
+    # backward walk from the peak, which is sensitive to exactly where that
+    # wobble sits and can silently give a very short, unstable fit window.
+    rising = working_signal[:peak_idx + 1]
+    low_val = low_frac * peak_value
+    high_val = high_frac * peak_value
+
+    low_candidates = np.where(rising <= low_val)[0]
+    high_candidates = np.where(rising <= high_val)[0]
+    if len(low_candidates) == 0 or len(high_candidates) == 0:
+        return np.nan
+
+    idx_low = low_candidates[0]
+    idx_high = high_candidates[0]
+    if idx_high <= idx_low:
+        return np.nan
+
+    fit_time = segment_time[idx_low:idx_high + 1]
+    fit_signal = working_signal[idx_low:idx_high + 1]
+
+    if len(fit_signal) < 2:
+        return np.nan
+
+    slope, intercept = np.polyfit(fit_time, fit_signal, 1)
+    return slope * sign
 
 # recording
-date = "26082026"
-rec_numbers = ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11"]
+date = "21092026"
+base_dir = ""  # set to "" for dates that aren't under acute/ (e.g. 21092026)
+rec_numbers = ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17"]
 
+# rec 04 (30 uA) ga ingen respons ("ingenting") ifolge notatene
 rec_to_intensity = {
-    "00": 25,
-    "01": 50,
-    "02": 75,
-    "03": 100,
-    "04": 125,
-    "05": 150,
-    "06": 175,
-    "07": 200,
-    "08": 225,
-    "09": 250,
-    "10": 275,
-    "11": 300,
+    "00": 20, "01": 10, "02": 5, "03": 5, "04": 30, "05": 30, "06": 40, "07": 50,
+    "08": 60, "09": 70, "10": 80, "11": 90, "12": 100, "13": 120, "14": 140,
+    "15": 160, "16": 180, "17": 200,
 }
 
-filename = f"{date}_FP_cell2_acute_sp__00"
+filename = f"{date}_cell1_sp_00"
+series_name = "sp"  # subfolder under plots/, keeps this series' output separate from others
+exclude_recs = ("04",)  # ga ingen respons ("ingenting") ifolge notatene - ren stoy, ikke ekte slope
 
 valid_recs = list(rec_to_intensity.keys())
 slope_by_rec = {}
 slope_sd_by_rec = {}
 
-Path(f"acute/{date}/plots/sp").mkdir(parents=True, exist_ok=True)
+plots_root = f"{base_dir}/{date}" if base_dir else date
+Path(f"{plots_root}/plots/{series_name}").mkdir(parents=True, exist_ok=True)
+
+# fixed y-limits for the raw-signal panel, shared across all recs, excluding the
+# stimulus artifact itself (stim to stim+3ms) so it doesn't blow out the scale
+raw_min, raw_max = np.inf, -np.inf
+for rec in rec_numbers:
+    abf = pyabf.ABF(str(f"{plots_root}/{filename}{rec}.abf"))
+    stim = stim_time_s(abf)
+    for sweep_number in abf.sweepList:
+        if sweep_number == 0:
+            continue
+        abf.setSweep(sweepNumber=sweep_number, channel=0)
+        time, signal = abf.sweepX, abf.sweepY
+        no_artifact_mask = (time < stim) | (time > stim + 0.003)
+        raw_min = min(raw_min, signal[no_artifact_mask].min())
+        raw_max = max(raw_max, signal[no_artifact_mask].max())
+raw_pad = 0.1 * (raw_max - raw_min)
+raw_ylim = (raw_min - raw_pad, raw_max + raw_pad)
 
 for rec in rec_numbers:
     fig, ax = plt.subplots(2, 1, figsize=(5, 6))
-    file_path = f"acute/{date}/{filename}{rec}.abf"
+    file_path = f"{plots_root}/{filename}{rec}.abf"
     slopes = []
     abf = pyabf.ABF(str(file_path))
     for sweep_number in abf.sweepList:
@@ -92,8 +134,7 @@ for rec in rec_numbers:
         time = abf.sweepX       # timepoints
         signal = abf.sweepY     # signal
 
-        peak_index = np.argmax(np.abs(signal))
-        peak_time = time[peak_index]
+        peak_time = stim_time_s(abf)
 
         signal_filtered = butter_lowpass(
                 signal,
@@ -118,9 +159,10 @@ for rec in rec_numbers:
 
         # raw signal
         ax[0].plot(time, signal, alpha=0.3, label=f"Sweep {sweep_number}")
-        ax[0].set_xlabel("Time (ms)")
-        ax[0].set_ylabel(abf.sweepLabelY, fontsize=5)
-        ax[0].set_title("FP recording - organotypic slices - raw signal")
+        ax[0].set_ylim(raw_ylim)
+        ax[0].set_xlabel("Time (s)")
+        ax[0].set_ylabel("Membrane potential (mV)")
+        ax[0].set_title("FP recording - sp - raw signal")
         ax[0].legend(loc="upper right", fontsize=6)
 
         ax[1].plot(time_window, signal_window, alpha=0.7, label=f"Sweep {sweep_number}")
@@ -135,13 +177,13 @@ for rec in rec_numbers:
     else:
         mean_slope = np.nanmean(slopes)
         sd_slope = np.nanstd(slopes)
-        if rec in valid_recs:
+        if rec in valid_recs and rec not in exclude_recs:
             slope_by_rec[rec] = mean_slope
             slope_sd_by_rec[rec] = sd_slope
 
     ax[1].set_title(f"FP recording in SP - current strength: {rec_to_intensity[rec]} uA (mean slope: {mean_slope:.4f} mV/s)", fontsize=8)
     plt.tight_layout()
-    plt.savefig(f"acute/{date}/plots/sp/all_sweeps{rec}.png", dpi=300)
+    plt.savefig(f"{plots_root}/plots/{series_name}/all_sweeps{rec}.png", dpi=300)
     plt.close()
 
 
@@ -157,4 +199,4 @@ plt.xlabel("Stimulus Intensity (µA)")
 plt.ylabel("|Slope| (mV/s)")
 plt.title(f"I/O Curve - SP (acute slices) - Mean Slope: {mean_slope_global:.4f} mV/s")
 plt.grid()
-plt.savefig(f"acute/{date}/plots/sp/io_curve.png", dpi=300)
+plt.savefig(f"{plots_root}/plots/{series_name}/io_curve.png", dpi=300)
