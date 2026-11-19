@@ -2,7 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pyabf
 from pathlib import Path
-from scipy.signal import butter, sosfiltfilt
+
+from fp_analysis import stim_time_s, preprocess, mean_trace, find_slope_window, compute_slope
 
 # ---- settings ----------------------------------------------------
 DATE = "22092026"
@@ -10,75 +11,12 @@ FOLDER = Path(DATE)
 # -----------------------------------------------------------------------
 
 
-def butter_lowpass(signal, sampling_rate, cutoff=500, order=4):
-    sos = butter(N=order, Wn=cutoff, btype="lowpass", fs=sampling_rate, output="sos")
-    return sosfiltfilt(sos, signal)
+def analyse_series(name, file_pattern, rec_to_intensity, ref_rec, fepsp_search_ms, exclude_recs=()):
+    """Run the per-sweep slope analysis + I/O curve for one file series.
 
-
-def stim_time_s(abf):
-    """Stimulus pulse time (s) = onset of the shortest step epoch in the command waveform."""
-    ep = abf.sweepEpochs
-    durations = [p2 - p1 for p1, p2 in zip(ep.p1s, ep.p2s)]
-    idx = durations.index(min(durations))
-    return ep.p1s[idx] / abf.dataRate
-
-
-def compute_slope(time, signal, peak_time, onset_offset=0.001, search_window=0.025, low_frac=0.2, high_frac=0.8):
-    search_start = peak_time + onset_offset
-    post_mask = (time >= search_start) & (time <= search_start + search_window)
-    segment_time = time[post_mask]
-    segment_signal = signal[post_mask]
-
-    if len(segment_signal) < 2:
-        return np.nan
-
-    # dominant deflection may be negative (fEPSP) or positive (population spike
-    # overtaking the fEPSP at higher stimulus strengths) — pick whichever is larger
-    idx_min = np.argmin(segment_signal)
-    idx_max = np.argmax(segment_signal)
-    if abs(segment_signal[idx_min]) >= abs(segment_signal[idx_max]):
-        sign, peak_idx = 1.0, idx_min
-    else:
-        sign, peak_idx = -1.0, idx_max
-
-    working_signal = segment_signal * sign  # dominant deflection now always a negative peak
-    peak_value = working_signal[peak_idx]
-
-    if peak_idx < 1:
-        return np.nan
-
-    # scan FORWARD from response onset to the peak for the first 20% and 80%
-    # threshold crossings. This only needs a first crossing, not an unbroken
-    # descent, so a small non-monotonic wobble (e.g. an early shoulder) before
-    # the real peak doesn't throw off where the fit window starts — unlike a
-    # backward walk from the peak, which is sensitive to exactly where that
-    # wobble sits and can silently give a very short, unstable fit window.
-    rising = working_signal[:peak_idx + 1]
-    low_val = low_frac * peak_value
-    high_val = high_frac * peak_value
-
-    low_candidates = np.where(rising <= low_val)[0]
-    high_candidates = np.where(rising <= high_val)[0]
-    if len(low_candidates) == 0 or len(high_candidates) == 0:
-        return np.nan
-
-    idx_low = low_candidates[0]
-    idx_high = high_candidates[0]
-    if idx_high <= idx_low:
-        return np.nan
-
-    fit_time = segment_time[idx_low:idx_high + 1]
-    fit_signal = working_signal[idx_low:idx_high + 1]
-
-    if len(fit_signal) < 2:
-        return np.nan
-
-    slope, intercept = np.polyfit(fit_time, fit_signal, 1)
-    return slope * sign
-
-
-def analyse_series(name, file_pattern, rec_to_intensity, exclude_recs=()):
-    """Run the per-sweep slope analysis + I/O curve for one file series."""
+    The slope window is fixed: defined once on the mean response of ref_rec (within
+    fepsp_search_ms after the stimulus, which must start after the fibre volley) and
+    then applied to every sweep and intensity in the series."""
     plots_dir = FOLDER / "plots" / name
     plots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -87,6 +25,17 @@ def analyse_series(name, file_pattern, rec_to_intensity, exclude_recs=()):
         print(f"[{name}] Fant ingen filer for mønster {file_pattern}")
         return
     print(f"[{name}] Fant {len(files)} filer")
+
+    ref_file = next(p for p in files if f"{int(p.stem[-4:]):02d}" == ref_rec)
+    ref_abf = pyabf.ABF(str(ref_file))
+    ref_time, ref_signal, ref_stim = mean_trace(ref_abf, ref_abf.sweepList)
+    slope_window = find_slope_window(ref_time, ref_signal, ref_stim,
+                                     search_s=(fepsp_search_ms[0] / 1000, fepsp_search_ms[1] / 1000))
+    if slope_window is None:
+        print(f"[{name}] Fant ikke fEPSP-flanke i referansen {ref_file.name} - sjekk ref_rec / fepsp_search_ms")
+        return
+    print(f"[{name}] Fast slope-vindu fra rec {ref_rec} ({rec_to_intensity[ref_rec]} uA): "
+          f"{slope_window[0] * 1000:.2f}-{slope_window[1] * 1000:.2f} ms etter stimulus")
 
     slope_by_rec = {}
     slope_sd_by_rec = {}
@@ -114,18 +63,15 @@ def analyse_series(name, file_pattern, rec_to_intensity, exclude_recs=()):
             time = abf.sweepX
             signal = abf.sweepY
 
-            signal_filtered = butter_lowpass(signal, sampling_rate=abf.dataRate, cutoff=500, order=4)
+            signal_filtered = preprocess(time, signal, stim, abf.dataRate)
 
             signal_length = 50 * 1e-3
-            baseline_mask = time >= stim + signal_length / 2
-            baseline = np.mean(signal_filtered[baseline_mask]) if baseline_mask.any() else 0.0
-            signal_filtered = signal_filtered - baseline
 
             mask = (time >= stim - signal_length / 4) & (time <= stim + 0.08)
             time_window = time[mask]
             signal_window = signal_filtered[mask]
 
-            slope = compute_slope(time, signal_filtered, stim)
+            slope = compute_slope(time, signal_filtered, stim, slope_window)
             slopes.append(slope)
 
             # exclude the artifact itself (stim to stim+3ms) when figuring out sensible y-limits
@@ -148,6 +94,7 @@ def analyse_series(name, file_pattern, rec_to_intensity, exclude_recs=()):
         ax[1].set_ylabel(f"Signal ({abf.adcUnits[0]})")
         if len(time_window):
             ax[1].set_xlim(time_window[0], time_window[-1])
+        ax[1].axvspan(stim + slope_window[0], stim + slope_window[1], color="grey", alpha=0.2, lw=0)
         ax[1].legend(loc="upper right", fontsize=6)
 
         if np.all(np.isnan(slopes)):
@@ -180,7 +127,8 @@ def analyse_series(name, file_pattern, rec_to_intensity, exclude_recs=()):
     plt.errorbar(x, y, yerr=yerr, marker="o", capsize=3)
     plt.xlabel("Stimulus Intensity (uA)")
     plt.ylabel("|Slope| (mV/s)")
-    plt.title(f"I/O Curve - {name} ({DATE})")
+    mean_slope_global = np.nanmean(list(slope_by_rec.values()))
+    plt.title(f"I/O Curve - {name} - Mean Slope: {mean_slope_global:.4f} mV/s")
     plt.grid()
     plt.tight_layout()
     plt.savefig(plots_dir / "io_curve.png", dpi=300)
@@ -216,11 +164,7 @@ def analyse_paired_pulse(name, file_pattern, rec_to_intensity, isi_s):
             abf.setSweep(sweepNumber=sweep_number, channel=0)
             time = abf.sweepX
             signal = abf.sweepY
-            signal_filtered = butter_lowpass(signal, sampling_rate=abf.dataRate, cutoff=500, order=4)
-
-            baseline_mask = time < stim1 - 0.002
-            baseline = np.mean(signal_filtered[baseline_mask]) if baseline_mask.any() else 0.0
-            signal_filtered = signal_filtered - baseline
+            signal_filtered = preprocess(time, signal, (stim1, stim2), abf.dataRate)
 
             mask = (time >= stim1 - 0.005) & (time <= stim2 + 0.03)
             ax.plot(time[mask] * 1000, signal_filtered[mask], lw=0.7, alpha=0.6)
@@ -256,18 +200,21 @@ sr_intensity = {
     "00": 25, "01": 10, "02": 5, "03": 50,
     "04": 50, "05": 75, "06": 100, "07": 125, "08": 150, "09": 175,
 }
-analyse_series("sr", "22092026_cell1_sr_[0-9][0-9][0-9][0-9].abf", sr_intensity, exclude_recs=("00", "01", "02", "03"))
+analyse_series("sr", "22092026_cell1_sr_[0-9][0-9][0-9][0-9].abf", sr_intensity,
+               ref_rec="07", fepsp_search_ms=(4.5, 20.0), exclude_recs=("00", "01", "02", "03"))
 
 # ==========================================================================
 sp_stimloc3_intensity = {"00": 100, "01": 125, "02": 150, "03": 250}
-analyse_series("sp_stimloc3", "22092026_cell1_sp_stimloc3_*.abf", sp_stimloc3_intensity)
+analyse_series("sp_stimloc3", "22092026_cell1_sp_stimloc3_*.abf", sp_stimloc3_intensity,
+               ref_rec="01", fepsp_search_ms=(5.0, 20.0))
 
 # ==========================================================================
 sr_loc4_intensity = {
     "00": 25, "01": 10, "02": 20, "03": 50,
     "04": 75, "05": 100, "06": 125, "07": 150,
 }
-analyse_series("sr_loc4", "22092026_cell1_sr_loc4_*.abf", sr_loc4_intensity)
+analyse_series("sr_loc4", "22092026_cell1_sr_loc4_*.abf", sr_loc4_intensity,
+               ref_rec="05", fepsp_search_ms=(4.0, 15.0))
 
 # ==========================================================================
 # Paired pulse - diagnostic only (no facilitation reported in lab notes)

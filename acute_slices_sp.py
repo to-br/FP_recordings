@@ -1,84 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import pyabf
-import scipy
 from pathlib import Path
-from scipy.signal import butter, sosfiltfilt
 
-def butter_lowpass(signal, sampling_rate, cutoff=500, order=4):
-    sos = butter(
-        N=order,
-        Wn=cutoff,
-        btype="lowpass",
-        fs=sampling_rate,
-        output="sos"
-    )
-
-    return sosfiltfilt(sos, signal)
-
-
-def stim_time_s(abf):
-    """Stimulus pulse time (s) = onset of the shortest step epoch in the command waveform."""
-    ep = abf.sweepEpochs
-    durations = [p2 - p1 for p1, p2 in zip(ep.p1s, ep.p2s)]
-    idx = durations.index(min(durations))
-    return ep.p1s[idx] / abf.dataRate
-
-
-def compute_slope(time, signal, peak_time, onset_offset=0.001, search_window=0.025, low_frac=0.2, high_frac=0.8):
-    # start litt etter artefakten, ikke ved peak_time selv
-    search_start = peak_time + onset_offset
-
-    post_mask = (time >= search_start) & (time <= search_start + search_window)
-    segment_time = time[post_mask]
-    segment_signal = signal[post_mask]
-
-    if len(segment_signal) < 2:
-        return np.nan
-
-    # dominant deflection may be negative (fEPSP) or positive (population spike
-    # overtaking the fEPSP at higher stimulus strengths) — pick whichever is larger
-    idx_min = np.argmin(segment_signal)
-    idx_max = np.argmax(segment_signal)
-    if abs(segment_signal[idx_min]) >= abs(segment_signal[idx_max]):
-        sign, peak_idx = 1.0, idx_min
-    else:
-        sign, peak_idx = -1.0, idx_max
-
-    working_signal = segment_signal * sign  # dominant deflection now always a negative peak
-    peak_value = working_signal[peak_idx]
-
-    if peak_idx < 1:
-        return np.nan
-
-    # scan FORWARD from response onset to the peak for the first 20% and 80%
-    # threshold crossings. This only needs a first crossing, not an unbroken
-    # descent, so a small non-monotonic wobble (e.g. an early shoulder) before
-    # the real peak doesn't throw off where the fit window starts — unlike a
-    # backward walk from the peak, which is sensitive to exactly where that
-    # wobble sits and can silently give a very short, unstable fit window.
-    rising = working_signal[:peak_idx + 1]
-    low_val = low_frac * peak_value
-    high_val = high_frac * peak_value
-
-    low_candidates = np.where(rising <= low_val)[0]
-    high_candidates = np.where(rising <= high_val)[0]
-    if len(low_candidates) == 0 or len(high_candidates) == 0:
-        return np.nan
-
-    idx_low = low_candidates[0]
-    idx_high = high_candidates[0]
-    if idx_high <= idx_low:
-        return np.nan
-
-    fit_time = segment_time[idx_low:idx_high + 1]
-    fit_signal = working_signal[idx_low:idx_high + 1]
-
-    if len(fit_signal) < 2:
-        return np.nan
-
-    slope, intercept = np.polyfit(fit_time, fit_signal, 1)
-    return slope * sign
+from fp_analysis import stim_time_s, preprocess, mean_trace, find_slope_window, compute_slope, pop_spike_amplitude
 
 # recording
 date = "21092026"
@@ -96,9 +21,19 @@ filename = f"{date}_cell1_sp_00"
 series_name = "sp"  # subfolder under plots/, keeps this series' output separate from others
 exclude_recs = ("04",)  # ga ingen respons ("ingenting") ifolge notatene - ren stoy, ikke ekte slope
 
+# fixed slope window: defined once on the mean response of ref_rec, then applied to
+# every sweep and intensity. In SP the fEPSP is positive-going (fepsp_polarity=+1).
+ref_rec = "10"
+fepsp_search_ms = (8.5, 12.0)
+fepsp_polarity = +1
+# population spike (tangent method) is measured separately, never mixed into the slope
+pop_spike_search_ms = (6.0, 12.0)
+
 valid_recs = list(rec_to_intensity.keys())
 slope_by_rec = {}
 slope_sd_by_rec = {}
+pop_by_rec = {}
+pop_sd_by_rec = {}
 
 plots_root = f"{base_dir}/{date}" if base_dir else date
 Path(f"{plots_root}/plots/{series_name}").mkdir(parents=True, exist_ok=True)
@@ -120,10 +55,23 @@ for rec in rec_numbers:
 raw_pad = 0.1 * (raw_max - raw_min)
 raw_ylim = (raw_min - raw_pad, raw_max + raw_pad)
 
+# ---- fixed slope window from the reference recording ----
+ref_abf = pyabf.ABF(str(f"{plots_root}/{filename}{ref_rec}.abf"))
+ref_time, ref_signal, ref_stim = mean_trace(ref_abf, ref_abf.sweepList[1:])
+slope_window = find_slope_window(ref_time, ref_signal, ref_stim,
+                                 search_s=(fepsp_search_ms[0] / 1000, fepsp_search_ms[1] / 1000),
+                                 polarity=fepsp_polarity)
+if slope_window is None:
+    raise SystemExit(f"Fant ikke fEPSP-flanke i referansen rec {ref_rec} - sjekk ref_rec / fepsp_search_ms")
+print(f"Fast slope-vindu fra rec {ref_rec} ({rec_to_intensity[ref_rec]} uA): "
+      f"{slope_window[0] * 1000:.2f}-{slope_window[1] * 1000:.2f} ms etter stimulus")
+pop_search_s = (pop_spike_search_ms[0] / 1000, pop_spike_search_ms[1] / 1000)
+
 for rec in rec_numbers:
     fig, ax = plt.subplots(2, 1, figsize=(5, 6))
     file_path = f"{plots_root}/{filename}{rec}.abf"
     slopes = []
+    pop_amps = []
     abf = pyabf.ABF(str(file_path))
     for sweep_number in abf.sweepList:
 
@@ -136,17 +84,9 @@ for rec in rec_numbers:
 
         peak_time = stim_time_s(abf)
 
-        signal_filtered = butter_lowpass(
-                signal,
-                sampling_rate=abf.dataRate,
-                cutoff=500,
-                order=4,)
+        signal_filtered = preprocess(time, signal, peak_time, abf.dataRate)
 
         signal_length = 50 * 1e-3
-
-        baseline_mask = (time >= peak_time + signal_length / 2)
-        baseline = np.mean(signal_filtered[baseline_mask])
-        signal_filtered = signal_filtered - baseline
 
         mask = (time >= peak_time - signal_length / 4) & (time <= peak_time + signal_length / 4 * 3)
 
@@ -154,8 +94,12 @@ for rec in rec_numbers:
         signal_window = signal_filtered[mask]
 
         # slope
-        slope = compute_slope(time, signal_filtered, peak_time)
+        slope = compute_slope(time, signal_filtered, peak_time, slope_window)
         slopes.append(slope)
+
+        # population spike amplitude (separate measure)
+        pop_amp, _ = pop_spike_amplitude(time, signal_filtered, peak_time, pop_search_s)
+        pop_amps.append(pop_amp)
 
         # raw signal
         ax[0].plot(time, signal, alpha=0.3, label=f"Sweep {sweep_number}")
@@ -181,7 +125,16 @@ for rec in rec_numbers:
             slope_by_rec[rec] = mean_slope
             slope_sd_by_rec[rec] = sd_slope
 
-    ax[1].set_title(f"FP recording in SP - current strength: {rec_to_intensity[rec]} uA (mean slope: {mean_slope:.4f} mV/s)", fontsize=8)
+    if np.all(np.isnan(pop_amps)):
+        mean_pop = np.nan
+    else:
+        mean_pop = np.nanmean(pop_amps)
+        if rec in valid_recs and rec not in exclude_recs:
+            pop_by_rec[rec] = mean_pop
+            pop_sd_by_rec[rec] = np.nanstd(pop_amps)
+
+    ax[1].axvspan(peak_time + slope_window[0], peak_time + slope_window[1], color="grey", alpha=0.2, lw=0)
+    ax[1].set_title(f"FP recording in SP - current strength: {rec_to_intensity[rec]} uA (mean slope: {mean_slope:.4f} mV/s, pop spike: {mean_pop:.3f} mV)", fontsize=8)
     plt.tight_layout()
     plt.savefig(f"{plots_root}/plots/{series_name}/all_sweeps{rec}.png", dpi=300)
     plt.close()
@@ -197,6 +150,19 @@ yerr = [slope_sd_by_rec[r] for r in sorted_recs]
 plt.errorbar(x, y, yerr=yerr, marker='o', capsize=3)
 plt.xlabel("Stimulus Intensity (µA)")
 plt.ylabel("|Slope| (mV/s)")
-plt.title(f"I/O Curve - SP (acute slices) - Mean Slope: {mean_slope_global:.4f} mV/s")
+plt.title(f"I/O Curve - SP - Mean Slope: {mean_slope_global:.4f} mV/s")
 plt.grid()
 plt.savefig(f"{plots_root}/plots/{series_name}/io_curve.png", dpi=300)
+
+#-------------------------I/O-CURVE POP SPIKE---------------------------
+plt.figure()
+sorted_recs = sorted(pop_by_rec, key=lambda r: rec_to_intensity[r])
+x = [rec_to_intensity[r] for r in sorted_recs]
+y = [pop_by_rec[r] for r in sorted_recs]
+yerr = [pop_sd_by_rec[r] for r in sorted_recs]
+plt.errorbar(x, y, yerr=yerr, marker='o', capsize=3)
+plt.xlabel("Stimulus Intensity (µA)")
+plt.ylabel("Pop spike amplitude (mV)")
+plt.title("I/O Curve - SP population spike (tangent method)", fontsize=9)
+plt.grid()
+plt.savefig(f"{plots_root}/plots/{series_name}/io_curve_pop_spike.png", dpi=300)
